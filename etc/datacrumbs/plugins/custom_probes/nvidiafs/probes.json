@@ -1,0 +1,11 @@
+[
+    {
+        "type": 1,
+        "name": "nvidiafs",
+        "functions": [
+            "nvfs_io_start_op",
+            "nvfs_get_p2p_dma_mapping",
+            "nvfs_mgroup_pin_shadow_pages"
+        ]
+    }
+]
