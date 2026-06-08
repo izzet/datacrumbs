@@ -3,7 +3,8 @@
 
 #include <datacrumbs/server/bpf/shared.h>
 
-/* Per-op cuFile/GDS event: like general_event_t plus signature-derived size+offset. */
+/* Per-op cuFile/GDS event: like general_event_t plus signature-derived size/offset, and (for batch)
+ * the number of sub-ops in the submit. */
 struct cufile_event_t {
   unsigned int type;
   unsigned long long id;
@@ -12,12 +13,14 @@ struct cufile_event_t {
   unsigned long long dur;
   unsigned long long size;
   unsigned long long offset;
+  unsigned long long count;  /* batch: # of CUfileIOParams_t in the submit (0 otherwise) */
 };
 
 /* args captured at uprobe entry, carried to uretprobe exit (keyed by fn_key_t). */
 struct cufile_args_t {
   unsigned long long size;
   unsigned long long offset;
+  unsigned long long count;
 };
 
 #endif  // DATACRUMBS_CUSTOM_PROBES_CUFILE_CUFILE_BPF_H

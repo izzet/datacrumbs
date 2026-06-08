@@ -23,6 +23,9 @@ datacrumbs::EventWithId* get_data_4(void* data, uint64_t index) {
     args->emplace("size", base->size);
     args->emplace("offset", base->offset);
   }
+  if (base->count != 0) {
+    args->emplace("count", base->count);  // batch: # of sub-ops in the submit
+  }
   auto event = new datacrumbs::EventWithId(NORMAL_EVENT, index, base->type, base->id,
                                            base->event_id, base->ts, base->dur, args);
   return event;

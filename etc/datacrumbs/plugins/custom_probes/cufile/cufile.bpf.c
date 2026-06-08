@@ -2,16 +2,23 @@
 
 #include <datacrumbs/server/bpf/common.h>
 
-/* carry entry args (size/offset) to the matching uretprobe, keyed per (tid,event_id) */
+/* carry entry args (size/offset/count) to the matching uretprobe, keyed per (tid,event_id) */
 DATACRUMBS_MAP(cufile_args_map, struct fn_key_t, struct cufile_args_t);
 
 #define CUFILE_EVENT_ID_START 200000
 #define CUFILE_LIB "/usr/local/cuda-12.6/targets/x86_64-linux/lib/libcufile.so"
 
-/* ---- entry: stamp start time; optionally stash signature-derived size/offset ---- */
+/* CUfileIOParams_t layout (cufile.h): stride 64 B; file_offset @ +16, size @ +32 (union.batch). */
+#define CUFILE_IOPARAMS_STRIDE 64
+#define CUFILE_IOPARAMS_OFF_FILEOFFSET 16
+#define CUFILE_IOPARAMS_OFF_SIZE 32
+#define CUFILE_BATCH_MAX 256  /* loop cap for the verifier */
+
+/* ---- entry: stamp start time; optionally stash signature-derived size/offset/count ---- */
 #if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
 static inline __attribute__((always_inline)) int cufile_entry(struct pt_regs* ctx, u64 event_id,
-                                                              u64 size, u64 offset, int has_args) {
+                                                              u64 size, u64 offset, u64 count,
+                                                              int has_args) {
   struct fn_key_t key = {};
   key.event_id = event_id;
   u64 start_ts;
@@ -23,18 +30,20 @@ static inline __attribute__((always_inline)) int cufile_entry(struct pt_regs* ct
     struct cufile_args_t a = {};
     a.size = size;
     a.offset = offset;
+    a.count = count;
     bpf_map_update_elem(&cufile_args_map, &key, &a, BPF_ANY);
   }
   return 0;
 }
 #else
 static inline __attribute__((always_inline)) int cufile_entry(struct pt_regs* ctx, u64 event_id,
-                                                              u64 size, u64 offset, int has_args) {
+                                                              u64 size, u64 offset, u64 count,
+                                                              int has_args) {
   return 0;
 }
 #endif
 
-/* ---- exit: emit cufile_event_t (type=3) with duration (+ size/offset if captured) ---- */
+/* ---- exit: emit cufile_event_t (type=4) with duration (+ size/offset/count if captured) ---- */
 #if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1) && defined(DATACRUMBS_MODE) && \
     (DATACRUMBS_MODE == 1)
 static inline __attribute__((always_inline)) int cufile_exit(struct pt_regs* ctx, u64 event_id) {
@@ -54,10 +63,12 @@ static inline __attribute__((always_inline)) int cufile_exit(struct pt_regs* ctx
   DATACRUMBS_COLLECT_TIME(event);
   event->size = 0;
   event->offset = 0;
+  event->count = 0;
   struct cufile_args_t* a = bpf_map_lookup_elem(&cufile_args_map, &key);
   if (a != 0) {
     event->size = a->size;
     event->offset = a->offset;
+    event->count = a->count;
     bpf_map_delete_elem(&cufile_args_map, &key);
   }
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
@@ -73,14 +84,14 @@ static inline __attribute__((always_inline)) int cufile_exit(struct pt_regs* ctx
  * cuFileRead/Write(fh, bufPtr_base, size, file_offset, bufPtr_offset): size=arg3, offset=arg4. */
 SEC("uprobe/" CUFILE_LIB ":cuFileRead")
 int BPF_UPROBE(cuFileRead_entry, void* fh, void* buf, u64 size, u64 file_offset) {
-  return cufile_entry(ctx, CUFILE_EVENT_ID_START + 0, size, file_offset, 1);
+  return cufile_entry(ctx, CUFILE_EVENT_ID_START + 0, size, file_offset, 0, 1);
 }
 SEC("uretprobe/" CUFILE_LIB ":cuFileRead")
 int BPF_URETPROBE(cuFileRead_exit) { return cufile_exit(ctx, CUFILE_EVENT_ID_START + 0); }
 
 SEC("uprobe/" CUFILE_LIB ":cuFileWrite")
 int BPF_UPROBE(cuFileWrite_entry, void* fh, void* buf, u64 size, u64 file_offset) {
-  return cufile_entry(ctx, CUFILE_EVENT_ID_START + 1, size, file_offset, 1);
+  return cufile_entry(ctx, CUFILE_EVENT_ID_START + 1, size, file_offset, 0, 1);
 }
 SEC("uretprobe/" CUFILE_LIB ":cuFileWrite")
 int BPF_URETPROBE(cuFileWrite_exit) { return cufile_exit(ctx, CUFILE_EVENT_ID_START + 1); }
@@ -91,22 +102,34 @@ int BPF_UPROBE(cuFileReadAsync_entry, void* fh, void* buf, u64* size_p, u64* fil
   u64 size = 0, off = 0;
   if (size_p) bpf_probe_read_user(&size, sizeof(size), size_p);
   if (file_offset_p) bpf_probe_read_user(&off, sizeof(off), file_offset_p);
-  return cufile_entry(ctx, CUFILE_EVENT_ID_START + 2, size, off, 1);
+  return cufile_entry(ctx, CUFILE_EVENT_ID_START + 2, size, off, 0, 1);
 }
 SEC("uretprobe/" CUFILE_LIB ":cuFileReadAsync")
 int BPF_URETPROBE(cuFileReadAsync_exit) { return cufile_exit(ctx, CUFILE_EVENT_ID_START + 2); }
 
-/* duration-only for now (batch params are an array; handle reg has no size). */
+/* cuFileBatchIOSubmit(batch, nr, CUfileIOParams_t* iocbp, flags): walk the array, sum per-op sizes,
+ * record nr as count and the total requested bytes as size. */
 SEC("uprobe/" CUFILE_LIB ":cuFileBatchIOSubmit")
-int BPF_UPROBE(cuFileBatchIOSubmit_entry) {
-  return cufile_entry(ctx, CUFILE_EVENT_ID_START + 3, 0, 0, 0);
+int BPF_UPROBE(cuFileBatchIOSubmit_entry, void* batch, unsigned int nr, void* iocbp,
+               unsigned int flags) {
+  u64 total = 0, off0 = 0;
+  unsigned int n = nr;
+  if (n > CUFILE_BATCH_MAX) n = CUFILE_BATCH_MAX;
+  for (unsigned int i = 0; i < n; i++) {
+    u64 sz = 0;
+    char* p = (char*)iocbp + (u64)i * CUFILE_IOPARAMS_STRIDE;
+    bpf_probe_read_user(&sz, sizeof(sz), p + CUFILE_IOPARAMS_OFF_SIZE);
+    total += sz;
+    if (i == 0) bpf_probe_read_user(&off0, sizeof(off0), p + CUFILE_IOPARAMS_OFF_FILEOFFSET);
+  }
+  return cufile_entry(ctx, CUFILE_EVENT_ID_START + 3, total, off0, nr, 1);
 }
 SEC("uretprobe/" CUFILE_LIB ":cuFileBatchIOSubmit")
 int BPF_URETPROBE(cuFileBatchIOSubmit_exit) { return cufile_exit(ctx, CUFILE_EVENT_ID_START + 3); }
 
 SEC("uprobe/" CUFILE_LIB ":cuFileHandleRegister")
 int BPF_UPROBE(cuFileHandleRegister_entry) {
-  return cufile_entry(ctx, CUFILE_EVENT_ID_START + 4, 0, 0, 0);
+  return cufile_entry(ctx, CUFILE_EVENT_ID_START + 4, 0, 0, 0, 0);
 }
 SEC("uretprobe/" CUFILE_LIB ":cuFileHandleRegister")
 int BPF_URETPROBE(cuFileHandleRegister_exit) { return cufile_exit(ctx, CUFILE_EVENT_ID_START + 4); }
