@@ -85,14 +85,9 @@ inline static int lookup_1(int map_fd, unsigned long long latest_timestamp,
 static datacrumbs::EventWithId* get_data_1(void* data, uint64_t index) {
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 1)
   struct general_event_t* base = (general_event_t*)data;
-  DataCrumbsArgs* args = nullptr;
-  if (base->size != 0) {  // GDS-Trace: attach per-op cuFile size/offset
-    args = new DataCrumbsArgs();
-    args->emplace("size", base->size);
-    args->emplace("offset", base->offset);
-  }
+
   auto event = new datacrumbs::EventWithId(NORMAL_EVENT, index, base->type, base->id,
-                                           base->event_id, base->ts, base->dur, args);
+                                           base->event_id, base->ts, base->dur, nullptr);
 #else
   struct counter_event_t* base = (counter_event_t*)data;
   auto args = new DataCrumbsArgs();

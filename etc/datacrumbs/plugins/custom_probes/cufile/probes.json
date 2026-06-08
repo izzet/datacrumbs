@@ -1,0 +1,14 @@
+[
+    {
+        "type": 2,
+        "name": "cufile",
+        "binary_path": "/usr/local/cuda-12.6/targets/x86_64-linux/lib/libcufile.so",
+        "functions": [
+            "cuFileRead",
+            "cuFileWrite",
+            "cuFileReadAsync",
+            "cuFileBatchIOSubmit",
+            "cuFileHandleRegister"
+        ]
+    }
+]

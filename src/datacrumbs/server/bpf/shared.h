@@ -12,8 +12,6 @@ struct general_event_t {
   unsigned long long event_id;
   unsigned long long ts;
   unsigned long long dur;
-  unsigned long long size;    /* GDS-Trace: cuFile op size (PARM3) */
-  unsigned long long offset;  /* GDS-Trace: cuFile op file_offset (PARM4) */
 };
 
 #define MAX_STR_READ_LEN 256
@@ -34,8 +32,6 @@ struct fn_key_t {
 
 struct fn_value_t {
   unsigned long long ts;
-  unsigned long long size;    /* GDS-Trace: entry arg PARM3 (cuFile size) */
-  unsigned long long offset;  /* GDS-Trace: entry arg PARM4 (cuFile file_offset) */
 };
 
 struct fn_t {

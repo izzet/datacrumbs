@@ -22,8 +22,6 @@ static inline __attribute__((always_inline)) int generic_trace_datacrumbs_start(
   event->event_id = event_id;
   event->ts = tsp;
   event->dur = 0;
-  event->size = 0;    /* GDS-Trace */
-  event->offset = 0;  /* GDS-Trace */
   DATACRUMBS_EVENT_SUBMIT(event, id, event_id);
 #endif
   return 0;
@@ -44,8 +42,6 @@ static inline __attribute__((always_inline)) int generic_trace_datacrumbs_stop()
   event->event_id = event_id;
   event->ts = bpf_ktime_get_ns();
   event->dur = 0;
-  event->size = 0;    /* GDS-Trace */
-  event->offset = 0;  /* GDS-Trace */
   DATACRUMBS_EVENT_SUBMIT(event, id, event_id);
 #endif
   return 0;

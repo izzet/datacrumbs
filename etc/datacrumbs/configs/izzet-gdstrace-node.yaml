@@ -1,6 +1,6 @@
 name: izzet-gdstrace-node
-# GDS-Trace host config: base syscall-I/O custom probes + a cuFile uprobe category so DataCrumbs
-# traces GDS ops (libcufile.so) alongside syscalls/block. cuFile = type-2 userspace uprobe.
+# GDS-Trace host config: base syscall-I/O custom probes (custom1) + a custom cuFile plugin (cufile)
+# with explicit, signature-aware uprobe handlers that capture per-op size/offset (event_type 3).
 capture_probes:
   - name: custom1
     start_event_id: 100000
@@ -11,7 +11,10 @@ capture_probes:
     process_header: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/sys_io/sysio_process.h
     event_type: 2
   - name: cufile
-    probe: uprobe
-    type: binary
-    file: /usr/local/cuda-12.6/targets/x86_64-linux/lib/libcufile.so
-    regex: cuFile(Read|Write|BatchIOSubmit|BatchIOGetStatus|HandleRegister).*
+    start_event_id: 200000
+    probe: custom
+    type: custom
+    file: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/cufile/cufile.bpf.c
+    probes: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/cufile/probes.json
+    process_header: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/cufile/cufile_process.h
+    event_type: 4

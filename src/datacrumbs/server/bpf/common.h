@@ -139,8 +139,6 @@ static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* c
   }
   struct fn_value_t fn = {};
   fn.ts = bpf_ktime_get_ns();
-  fn.size = PT_REGS_PARM3(ctx);    /* GDS-Trace: cuFileRead/Write size arg */
-  fn.offset = PT_REGS_PARM4(ctx);  /* GDS-Trace: cuFileRead/Write file_offset arg */
   bpf_map_update_elem(&fn_pid_map, &key, &fn, BPF_ANY);
   DBG_PRINTK("Pushed pid:%d, event_id:%llu to map\n", (u32)key.id, event_id);
   return 0;
@@ -155,8 +153,6 @@ static inline __attribute__((always_inline)) int generic_entry(struct pt_regs* c
   }
   struct fn_value_t fn = {};
   fn.ts = bpf_ktime_get_ns();
-  fn.size = PT_REGS_PARM3(ctx);    /* GDS-Trace: cuFileRead/Write size arg */
-  fn.offset = PT_REGS_PARM4(ctx);  /* GDS-Trace: cuFileRead/Write file_offset arg */
   bpf_map_update_elem(&fn_pid_map, &key, &fn, BPF_ANY);
   DBG_PRINTK("Pushed pid:%d, event_id:%llu to map\n", (u32)key.id, event_id);
   return 0;
@@ -186,8 +182,6 @@ static inline __attribute__((always_inline)) int generic_exit(struct pt_regs* ct
   event->id = key.id;
   event->event_id = event_id;
   DATACRUMBS_COLLECT_TIME(event);
-  event->size = fn->size;      /* GDS-Trace: per-op cuFile size */
-  event->offset = fn->offset;  /* GDS-Trace: per-op cuFile file_offset */
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
   return 0;
 }
@@ -243,8 +237,6 @@ static inline __attribute__((always_inline)) int usdt_entry(struct pt_regs* ctx,
   }
   struct fn_value_t fn = {};
   fn.ts = bpf_ktime_get_ns();
-  fn.size = PT_REGS_PARM3(ctx);    /* GDS-Trace: cuFileRead/Write size arg */
-  fn.offset = PT_REGS_PARM4(ctx);  /* GDS-Trace: cuFileRead/Write file_offset arg */
   bpf_map_update_elem(&fn_pid_map, &key, &fn, BPF_ANY);
   DBG_PRINTK("USDT  Pushed pid:%d, event_id:%llu to map\n", (u32)key.id, event_id);
   return 0;
