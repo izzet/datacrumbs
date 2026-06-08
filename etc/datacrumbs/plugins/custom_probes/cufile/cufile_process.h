@@ -26,6 +26,9 @@ datacrumbs::EventWithId* get_data_4(void* data, uint64_t index) {
   if (base->count != 0) {
     args->emplace("count", base->count);  // batch: # of sub-ops in the submit
   }
+  if (base->corr_id != 0) {
+    args->emplace("corr_id", base->corr_id);  // device ops carry the same id -> cross-layer attribution
+  }
   auto event = new datacrumbs::EventWithId(NORMAL_EVENT, index, base->type, base->id,
                                            base->event_id, base->ts, base->dur, args);
   return event;

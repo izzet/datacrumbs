@@ -21,6 +21,9 @@ datacrumbs::EventWithId* get_data_5(void* data, uint64_t index) {
   auto args = new DataCrumbsArgs();
   args->emplace("size", base->size);
   args->emplace("sector", base->sector);
+  if (base->corr_id != 0) {
+    args->emplace("corr_id", base->corr_id);  // -> the cuFileRead this NVMe command belongs to
+  }
   auto event = new datacrumbs::EventWithId(NORMAL_EVENT, index, base->type, base->id,
                                            base->event_id, base->ts, base->dur, args);
   return event;

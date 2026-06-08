@@ -2,6 +2,8 @@
 
 #include <datacrumbs/server/bpf/common.h>
 
+#include "../gdstrace_corr.bpf.h"  // cross-layer correlation (maps owned by the cuFile plugin)
+
 #define BLOCK_EVENT_ID_START 300000
 
 /* Point event at NVMe command setup. Entry-only (dur=0): records the device-command size+sector for
@@ -25,6 +27,7 @@ static inline __attribute__((always_inline)) int block_point(struct pt_regs* ctx
   event->dur = 0;
   event->size = size;
   event->sector = sector;
+  event->corr_id = gdstrace_corr_current();  // the cuFileRead this NVMe cmd belongs to (0 if none)
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
   return 0;
 }

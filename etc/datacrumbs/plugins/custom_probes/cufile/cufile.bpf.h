@@ -13,7 +13,8 @@ struct cufile_event_t {
   unsigned long long dur;
   unsigned long long size;
   unsigned long long offset;
-  unsigned long long count;  /* batch: # of CUfileIOParams_t in the submit (0 otherwise) */
+  unsigned long long count;     /* batch: # of CUfileIOParams_t in the submit (0 otherwise) */
+  unsigned long long corr_id;   /* correlation id (= this op's entry ts); device ops carry the same */
 };
 
 /* args captured at uprobe entry, carried to uretprobe exit (keyed by fn_key_t). */

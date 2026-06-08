@@ -2,6 +2,10 @@
 
 #include <datacrumbs/server/bpf/common.h>
 
+/* cuFile plugin OWNS the GDS-Trace correlation maps; nvidiafs/block extern them. */
+#define GDSTRACE_CORR_OWNER
+#include "../gdstrace_corr.bpf.h"
+
 /* carry entry args (size/offset/count) to the matching uretprobe, keyed per (tid,event_id) */
 DATACRUMBS_MAP(cufile_args_map, struct fn_key_t, struct cufile_args_t);
 
@@ -26,6 +30,9 @@ static inline __attribute__((always_inline)) int cufile_entry(struct pt_regs* ct
   struct fn_value_t fn = {};
   fn.ts = bpf_ktime_get_ns();
   bpf_map_update_elem(&fn_pid_map, &key, &fn, BPF_ANY);
+  /* register this op's corr_id (= entry ts) so device ops (nvfs_io/NVMe) attribute to it by id,
+   * whether they fire on this thread (synchronous) or on cuFile's worker threads (fastsafetensors). */
+  gdstrace_corr_begin(fn.ts);
   if (has_args) {
     struct cufile_args_t a = {};
     a.size = size;
@@ -54,6 +61,8 @@ static inline __attribute__((always_inline)) int cufile_exit(struct pt_regs* ctx
   if (!need_tracing(&key, &start_ts)) return 0;
   struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
   if (fn == 0) return 0;  // missed entry
+  u64 corr = fn->ts;     // this op's correlation id (= entry ts)
+  gdstrace_corr_end();   // op done: stop attributing device ops to it
   DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
   struct cufile_event_t* event;
   DATACRUMBS_RB_RESERVE(output, struct cufile_event_t, event);
@@ -61,6 +70,7 @@ static inline __attribute__((always_inline)) int cufile_exit(struct pt_regs* ctx
   event->id = key.id;
   event->event_id = event_id;
   DATACRUMBS_COLLECT_TIME(event);
+  event->corr_id = corr;
   event->size = 0;
   event->offset = 0;
   event->count = 0;
