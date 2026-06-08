@@ -120,7 +120,7 @@ static inline __attribute__((always_inline)) int need_tracing(struct fn_key_t* k
 #else
 static inline __attribute__((always_inline)) int need_tracing(struct fn_key_t* key, u64* start_ts) {
   key->id = bpf_get_current_pid_tgid();
-  u32 pid = key->id & 0xFFFFFFFF;
+  u32 pid = key->id >> 32;  // GDS-Trace: filter by TGID (process), not TID, to catch worker threads
   (void)pid;
   start_ts = (u64*)bpf_map_lookup_elem(&pid_map, &pid);
   if (start_ts == 0 || key->id == 0) return 0;
