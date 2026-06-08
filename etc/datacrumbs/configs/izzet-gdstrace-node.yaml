@@ -18,3 +18,11 @@ capture_probes:
     probes: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/cufile/probes.json
     process_header: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/cufile/cufile_process.h
     event_type: 4
+  - name: block
+    start_event_id: 300000
+    probe: custom
+    type: custom
+    file: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/block/block.bpf.c
+    probes: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/block/probes.json
+    process_header: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/block/block_process.h
+    event_type: 5

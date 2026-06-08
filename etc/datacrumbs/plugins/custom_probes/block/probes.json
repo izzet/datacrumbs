@@ -1,0 +1,9 @@
+[
+    {
+        "type": 1,
+        "name": "block",
+        "functions": [
+            "nvme_setup_cmd"
+        ]
+    }
+]
