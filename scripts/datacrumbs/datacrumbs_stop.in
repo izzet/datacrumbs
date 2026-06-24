@@ -14,8 +14,23 @@ if [[ "$DATACRUMBS_IS_ROOT" != "1" ]]; then
 	exit 1
 fi
 
-if [[ "$PROG_NAME" == "" ]]; then
-	ps -aef | grep 'datacrumbs' | grep ${DATACRUMBS_USER} | awk '{print $2}' | xargs kill -9
-else
-	ps -aef | grep 'datacrumbs' | grep ${DATACRUMBS_USER} | grep -v $PROG_NAME | awk '{print $2}' | xargs kill -9
-fi
+# Collect server-side datacrumbs pids for this user. NOTE: '[d]atacrumbs' so the
+# grep process (and unrelated shells) don't match themselves.
+collect_pids() {
+	if [[ "$PROG_NAME" == "" ]]; then
+		ps -aef | grep '[d]atacrumbs' | grep "${DATACRUMBS_USER}" | awk '{print $2}'
+	else
+		ps -aef | grep '[d]atacrumbs' | grep "${DATACRUMBS_USER}" | grep -v "$PROG_NAME" | awk '{print $2}'
+	fi
+}
+# Graceful FIRST: the server flushes its .pfw.gz trace only on SIGINT (finalize/
+# fflush handler); a bare 'kill -9' loses the whole trace. Wait for graceful exit,
+# then SIGKILL any stragglers.
+PIDS=$(collect_pids)
+[[ -n "$PIDS" ]] && echo "$PIDS" | xargs -r kill -INT 2>/dev/null || true
+for _ in $(seq 1 60); do
+	[[ -z "$(collect_pids)" ]] && break
+	sleep 0.2
+done
+PIDS=$(collect_pids)
+[[ -n "$PIDS" ]] && echo "$PIDS" | xargs -r kill -9 2>/dev/null || true
