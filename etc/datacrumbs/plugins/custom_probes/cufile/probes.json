@@ -8,7 +8,8 @@
             "cuFileWrite",
             "cuFileReadAsync",
             "cuFileBatchIOSubmit",
-            "cuFileHandleRegister"
+            "cuFileHandleRegister",
+            "pread"
         ]
     }
 ]

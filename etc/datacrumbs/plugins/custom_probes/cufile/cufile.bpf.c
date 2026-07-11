@@ -143,3 +143,67 @@ int BPF_UPROBE(cuFileHandleRegister_entry) {
 }
 SEC("uretprobe/" CUFILE_LIB ":cuFileHandleRegister")
 int BPF_URETPROBE(cuFileHandleRegister_exit) { return cufile_exit(ctx, CUFILE_EVENT_ID_START + 4); }
+
+/* ===== POSIX pread offset capture (for the silent kvikio POSIX-bypass class) =====
+ * These reads never enter cuFile, so they must NOT register a corr_id (that is the whole point: the
+ * time basis cannot see them). We only capture size+offset so the ADDRESS basis can attribute each
+ * bypassed device command to the exact pread that issued it. libc pread64==pread==__pread64 (aliases). */
+#define LIBC_PATH "/usr/lib/x86_64-linux-gnu/libc.so.6"
+#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
+static inline __attribute__((always_inline)) int pread_entry(struct pt_regs* ctx, u64 event_id,
+                                                             u64 count, u64 offset) {
+  struct fn_key_t key = {};
+  key.event_id = event_id;
+  u64 start_ts;
+  if (!need_tracing(&key, &start_ts)) return 0;  // not tracing this process
+  struct fn_value_t fn = {};
+  fn.ts = bpf_ktime_get_ns();
+  bpf_map_update_elem(&fn_pid_map, &key, &fn, BPF_ANY);
+  struct cufile_args_t a = {};
+  a.size = count; a.offset = offset; a.count = 0;   // NB: no gdstrace_corr_begin -> POSIX carries no corr_id
+  bpf_map_update_elem(&cufile_args_map, &key, &a, BPF_ANY);
+  return 0;
+}
+#else
+static inline __attribute__((always_inline)) int pread_entry(struct pt_regs* ctx, u64 event_id,
+                                                             u64 count, u64 offset) { return 0; }
+#endif
+
+#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1) && defined(DATACRUMBS_MODE) && \
+    (DATACRUMBS_MODE == 1)
+static inline __attribute__((always_inline)) int pread_exit(struct pt_regs* ctx, u64 event_id) {
+  u64 te = bpf_ktime_get_ns();
+  struct fn_key_t key = {};
+  key.event_id = event_id;
+  u64 start_ts;
+  if (!need_tracing(&key, &start_ts)) return 0;
+  struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
+  if (fn == 0) return 0;  // missed entry
+  DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
+  struct cufile_event_t* event;
+  DATACRUMBS_RB_RESERVE(output, struct cufile_event_t, event);
+  event->type = 4;
+  event->id = key.id;
+  event->event_id = event_id;
+  DATACRUMBS_COLLECT_TIME(event);
+  event->corr_id = 0;  // POSIX: no cuFile correlation id
+  event->size = 0; event->offset = 0; event->count = 0;
+  struct cufile_args_t* a = bpf_map_lookup_elem(&cufile_args_map, &key);
+  if (a != 0) {
+    event->size = a->size; event->offset = a->offset;
+    bpf_map_delete_elem(&cufile_args_map, &key);
+  }
+  DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  return 0;
+}
+#else
+static inline __attribute__((always_inline)) int pread_exit(struct pt_regs* ctx, u64 event_id) { return 0; }
+#endif
+
+/* pread(fd, buf, count, offset): count=arg3, offset=arg4. */
+SEC("uprobe/" LIBC_PATH ":pread")
+int BPF_UPROBE(pread_gds_entry, int fd, void* buf, u64 count, u64 offset) {
+  return pread_entry(ctx, CUFILE_EVENT_ID_START + 5, count, offset);
+}
+SEC("uretprobe/" LIBC_PATH ":pread")
+int BPF_URETPROBE(pread_gds_exit) { return pread_exit(ctx, CUFILE_EVENT_ID_START + 5); }
