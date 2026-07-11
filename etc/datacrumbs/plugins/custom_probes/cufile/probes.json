@@ -9,7 +9,8 @@
             "cuFileReadAsync",
             "cuFileBatchIOSubmit",
             "cuFileHandleRegister",
-            "pread"
+            "pread",
+            "batchentry"
         ]
     }
 ]

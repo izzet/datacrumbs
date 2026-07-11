@@ -90,6 +90,45 @@ static inline __attribute__((always_inline)) int cufile_exit(struct pt_regs* ctx
 }
 #endif
 
+/* ===== per-entry batch OP records =====
+ * cuFileBatchIOSubmit carries nr independent (offset,size) requests. The one call is one temporal
+ * event (batch-granular time basis), but the address basis needs each entry's range, so we emit one
+ * 'batchentry' event per iocbp[i] carrying its own offset/size and the shared batch corr_id. */
+#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1) && defined(DATACRUMBS_MODE) && \
+    (DATACRUMBS_MODE == 1)
+static inline __attribute__((always_inline)) int batch_emit(struct pt_regs* ctx, void* iocbp,
+                                                            unsigned int nr) {
+  u64 event_id = CUFILE_EVENT_ID_START + 6;   /* 'batchentry' */
+  struct fn_key_t key = {};
+  key.event_id = CUFILE_EVENT_ID_START + 3;   /* the batch op registered its corr_id under this key */
+  u64 start_ts;
+  if (!need_tracing(&key, &start_ts)) return 0;
+  struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
+  u64 corr = fn ? fn->ts : 0;
+  unsigned int n = nr;
+  if (n > CUFILE_BATCH_MAX) n = CUFILE_BATCH_MAX;
+  for (unsigned int i = 0; i < n; i++) {
+    u64 sz = 0, off = 0;
+    char* p = (char*)iocbp + (u64)i * CUFILE_IOPARAMS_STRIDE;
+    bpf_probe_read_user(&sz, sizeof(sz), p + CUFILE_IOPARAMS_OFF_SIZE);
+    bpf_probe_read_user(&off, sizeof(off), p + CUFILE_IOPARAMS_OFF_FILEOFFSET);
+    struct cufile_event_t* event;
+    DATACRUMBS_RB_RESERVE(output, struct cufile_event_t, event);
+    event->type = 4;
+    event->id = key.id;
+    event->event_id = event_id;
+    event->ts = corr; event->dur = 0;
+    event->corr_id = corr;
+    event->size = sz; event->offset = off; event->count = 0;
+    DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  }
+  return 0;
+}
+#else
+static inline __attribute__((always_inline)) int batch_emit(struct pt_regs* ctx, void* iocbp,
+                                                            unsigned int nr) { return 0; }
+#endif
+
 /* ===== explicit, signature-aware SEC programs per cuFile function =====
  * cuFileRead/Write(fh, bufPtr_base, size, file_offset, bufPtr_offset): size=arg3, offset=arg4. */
 SEC("uprobe/" CUFILE_LIB ":cuFileRead")
@@ -132,7 +171,8 @@ int BPF_UPROBE(cuFileBatchIOSubmit_entry, void* batch, unsigned int nr, void* io
     total += sz;
     if (i == 0) bpf_probe_read_user(&off0, sizeof(off0), p + CUFILE_IOPARAMS_OFF_FILEOFFSET);
   }
-  return cufile_entry(ctx, CUFILE_EVENT_ID_START + 3, total, off0, nr, 1);
+  cufile_entry(ctx, CUFILE_EVENT_ID_START + 3, total, off0, nr, 1);   /* batch-level: corr_id + aggregate */
+  return batch_emit(ctx, iocbp, nr);                                  /* per-entry OP records for address */
 }
 SEC("uretprobe/" CUFILE_LIB ":cuFileBatchIOSubmit")
 int BPF_URETPROBE(cuFileBatchIOSubmit_exit) { return cufile_exit(ctx, CUFILE_EVENT_ID_START + 3); }
