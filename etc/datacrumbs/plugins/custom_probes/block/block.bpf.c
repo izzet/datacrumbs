@@ -27,7 +27,9 @@ static inline __attribute__((always_inline)) int block_point(struct pt_regs* ctx
   event->dur = 0;
   event->size = size;
   event->sector = sector;
-  event->corr_id = gdstrace_corr_current();  // the cuFileRead this NVMe cmd belongs to (0 if none)
+  u32 sync = 0;
+  event->corr_id = gdstrace_corr_current(&sync);  // the cuFileRead this NVMe cmd belongs to (0 if none)
+  event->sync = sync;                             // 1 = same-thread valid owner; 0 = fallback/none
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
   return 0;
 }

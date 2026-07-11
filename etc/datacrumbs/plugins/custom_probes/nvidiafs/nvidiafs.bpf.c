@@ -23,7 +23,7 @@ static inline __attribute__((always_inline)) int nvfs_point(struct pt_regs* ctx,
   event->event_id = event_id;
   event->ts = ts;
   event->dur = 0;
-  event->corr_id = gdstrace_corr_current();  // the cuFileRead this op belongs to (0 if none)
+  event->corr_id = gdstrace_corr_current(0);  // the cuFileRead this op belongs to (0 if none)
   DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
   return 0;
 }

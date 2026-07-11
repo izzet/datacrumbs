@@ -59,16 +59,20 @@ static inline __attribute__((always_inline)) void gdstrace_corr_end(void) {
   bpf_map_delete_elem(&cufile_active_op, &tid);
 }
 
-/* device-layer: corr_id of the cuFile op this op belongs to (0 if none / ambiguous). */
-static inline __attribute__((always_inline)) u64 gdstrace_corr_current(void) {
+/* device-layer: corr_id of the cuFile op this op belongs to (0 if none). *sync_out=1 iff the id came from
+ * the same-thread active_op path -- a synchronous op holds its thread, so nothing foreign can fire on it
+ * while active_op is set, making this a provably VALID owner. The off-thread process fallback sets
+ * *sync_out=0 (best-effort; the offline composition never trusts it to break an address tie). */
+static inline __attribute__((always_inline)) u64 gdstrace_corr_current(u32* sync_out) {
   u64 pt = bpf_get_current_pid_tgid();
   u32 tid = (u32)pt, tgid = (u32)(pt >> 32);
+  if (sync_out) *sync_out = 0;
   u64* c = bpf_map_lookup_elem(&cufile_active_op, &tid);
-  if (c) return *c;  // same-thread (synchronous cuFile)
+  if (c) { if (sync_out) *sync_out = 1; return *c; }  // same-thread -> VALID owner
   struct cufile_proc_t* p = bpf_map_lookup_elem(&cufile_proc, &tgid);
   if (p) {
-    u64 cnt = p->cnt, xorv = p->xorv;   // aligned u64 reads are atomic; a torn pair -> non-id -> miss
-    if (cnt == 1) return xorv;          // worker thread + exactly one active op -> its id
+    u64 cnt = p->cnt, xorv = p->xorv;
+    if (cnt == 1) return xorv;          // off-thread fallback -> sync_out stays 0 (untrusted)
   }
   return 0;
 }
