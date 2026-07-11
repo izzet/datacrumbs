@@ -7,55 +7,56 @@
  * corr_id of the cuFileRead they belong to, so DFAnalyzer attributes by id rather than fragile
  * time-containment (which breaks when cuFile pipelines async ops or uses worker threads). Two paths:
  *   - same thread  (synchronous cuFile: gdsio/kvikio): cufile_active_op[tid]            -> exact.
- *   - worker thread (cuFile's internal pool: fastsafetensors): fall back to cufile_active_xor[tgid], the
- *     XOR of all active corr_ids, used ONLY when exactly one cuFile op is active (cufile_op_count[tgid]==1),
- *     where the XOR equals that sole op's id -- sound even when other ops entered and exited meanwhile
- *     (a plain last-writer proc[tgid] is not: count==1 does not imply it holds the surviving op). Under
- *     concurrency we return 0 (the same-thread path already attributes those correctly).
+ *   - worker thread (cuFile's internal pool: fastsafetensors): fall back to cufile_proc[tgid].xorv, the
+ *     XOR of all active corr_ids, used ONLY when exactly one op is active (cufile_proc[tgid].cnt==1),
+ *     where the XOR equals that sole op's id. cnt and xorv are updated with ATOMIC ops (bpf_spin_lock is
+ *     rejected in tracing programs), so concurrent entry/exit on different threads never lose an update.
+ *     A torn read of the pair (new cnt, old xorv) is self-invalidating: xorv would be A^B, not any real
+ *     corr_id, so it misses the cufile table and yields no attribution (address handles the command)
+ *     rather than a wrong one. The per-thread active_op is single-writer and needs no atomics.
  *
  * The cuFile plugin defines the maps (include with GDSTRACE_CORR_OWNER); nvidiafs/block include for
  * externs. All plugin objects are statically linked into one datacrumbs.bpf.o, so the externs resolve.
  * Requires common.h included first (u32/u64 types + the DATACRUMBS_MAP macros + bpf helpers). */
 
+struct cufile_proc_t {          /* per-process active-op accounting, updated with atomic ops */
+  u64 cnt;                       /* # of cuFile ops currently active in this tgid */
+  u64 xorv;                      /* XOR of their corr_ids (== the sole id when cnt==1) */
+};
+
 #ifdef GDSTRACE_CORR_OWNER
-DATACRUMBS_MAP(cufile_active_op, u32, u64, 10240);  // tid  -> active cuFile op corr_id (same-thread)
-DATACRUMBS_MAP(cufile_op_count, u32, u64, 10240);   // tgid -> # of cuFile ops currently active
-DATACRUMBS_MAP(cufile_active_xor, u32, u64, 10240); // tgid -> XOR of active corr_ids (== sole id when count==1)
+DATACRUMBS_MAP(cufile_active_op, u32, u64, 10240);             // tid  -> active corr_id (per-thread, no lock)
+DATACRUMBS_MAP(cufile_proc, u32, struct cufile_proc_t, 10240); // tgid -> {cnt,xorv} under a spin lock
 #else
 DATACRUMBS_MAP_EXTERN(cufile_active_op, u32, u64, 10240);
-DATACRUMBS_MAP_EXTERN(cufile_op_count, u32, u64, 10240);
-DATACRUMBS_MAP_EXTERN(cufile_active_xor, u32, u64, 10240);
+DATACRUMBS_MAP_EXTERN(cufile_proc, u32, struct cufile_proc_t, 10240);
 #endif
 
-/* cuFile op entry: register corr_id for this thread and bump the per-process active count. */
+/* cuFile op entry: register corr_id for this thread and atomically bump the per-process (cnt,xorv). */
 static inline __attribute__((always_inline)) void gdstrace_corr_begin(u64 corr_id) {
   u64 pt = bpf_get_current_pid_tgid();
   u32 tid = (u32)pt, tgid = (u32)(pt >> 32);
   bpf_map_update_elem(&cufile_active_op, &tid, &corr_id, BPF_ANY);
-  u64* c = bpf_map_lookup_elem(&cufile_op_count, &tgid);
-  u64 n = (c ? *c : 0) + 1;
-  bpf_map_update_elem(&cufile_op_count, &tgid, &n, BPF_ANY);
-  u64* x = bpf_map_lookup_elem(&cufile_active_xor, &tgid);
-  u64 xv = (x ? *x : 0) ^ corr_id;
-  bpf_map_update_elem(&cufile_active_xor, &tgid, &xv, BPF_ANY);
+  struct cufile_proc_t init = {};
+  bpf_map_update_elem(&cufile_proc, &tgid, &init, BPF_NOEXIST);  // create once if absent
+  struct cufile_proc_t* p = bpf_map_lookup_elem(&cufile_proc, &tgid);
+  if (p) {
+    __sync_fetch_and_add(&p->cnt, 1);
+    __sync_fetch_and_xor(&p->xorv, corr_id);
+  }
 }
 
-/* cuFile op exit: deregister, and XOR this op's id back out so cufile_active_xor holds only still-active ids. */
+/* cuFile op exit: deregister; atomically XOR this op's id back out and decrement cnt. */
 static inline __attribute__((always_inline)) void gdstrace_corr_end(void) {
   u64 pt = bpf_get_current_pid_tgid();
   u32 tid = (u32)pt, tgid = (u32)(pt >> 32);
   u64* mine = bpf_map_lookup_elem(&cufile_active_op, &tid);
-  if (mine) {
-    u64* x = bpf_map_lookup_elem(&cufile_active_xor, &tgid);
-    if (x) { u64 xv = *x ^ *mine; bpf_map_update_elem(&cufile_active_xor, &tgid, &xv, BPF_ANY); }
+  struct cufile_proc_t* p = bpf_map_lookup_elem(&cufile_proc, &tgid);
+  if (p && mine) {
+    __sync_fetch_and_xor(&p->xorv, *mine);
+    __sync_fetch_and_add(&p->cnt, (u64)-1);
   }
   bpf_map_delete_elem(&cufile_active_op, &tid);
-  u64* c = bpf_map_lookup_elem(&cufile_op_count, &tgid);
-  if (c && *c > 0) {
-    u64 n = *c - 1;
-    bpf_map_update_elem(&cufile_op_count, &tgid, &n, BPF_ANY);
-    if (n == 0) bpf_map_delete_elem(&cufile_active_xor, &tgid);
-  }
 }
 
 /* device-layer: corr_id of the cuFile op this op belongs to (0 if none / ambiguous). */
@@ -64,10 +65,10 @@ static inline __attribute__((always_inline)) u64 gdstrace_corr_current(void) {
   u32 tid = (u32)pt, tgid = (u32)(pt >> 32);
   u64* c = bpf_map_lookup_elem(&cufile_active_op, &tid);
   if (c) return *c;  // same-thread (synchronous cuFile)
-  u64* cnt = bpf_map_lookup_elem(&cufile_op_count, &tgid);
-  if (cnt && *cnt == 1) {  // worker thread + exactly one active op -> XOR is that op's id (sound under overlap)
-    u64* xp = bpf_map_lookup_elem(&cufile_active_xor, &tgid);
-    if (xp) return *xp;
+  struct cufile_proc_t* p = bpf_map_lookup_elem(&cufile_proc, &tgid);
+  if (p) {
+    u64 cnt = p->cnt, xorv = p->xorv;   // aligned u64 reads are atomic; a torn pair -> non-id -> miss
+    if (cnt == 1) return xorv;          // worker thread + exactly one active op -> its id
   }
   return 0;
 }
