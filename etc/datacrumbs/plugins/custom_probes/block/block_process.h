@@ -21,8 +21,9 @@ datacrumbs::EventWithId* get_data_5(void* data, uint64_t index) {
   auto args = new DataCrumbsArgs();
   args->emplace("size", base->size);
   args->emplace("sector", base->sector);
+  args->emplace("op", base->op);  // 0 = read, 1 = write (RMW reads under a write workload)
   if (base->corr_id != 0) {
-    args->emplace("corr_id", base->corr_id);  // -> the cuFileRead this NVMe command belongs to
+    args->emplace("corr_id", base->corr_id);  // -> the cuFile op this NVMe command belongs to
     args->emplace("sync", base->sync);        // 1 = same-thread valid owner (trust for tie-break); 0 = fallback
   }
   auto event = new datacrumbs::EventWithId(NORMAL_EVENT, index, base->type, base->id,
