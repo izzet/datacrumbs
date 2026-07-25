@@ -10,7 +10,8 @@
             "cuFileBatchIOSubmit",
             "cuFileHandleRegister",
             "pread",
-            "batchentry"
+            "batchentry",
+            "pwrite"
         ]
     }
 ]

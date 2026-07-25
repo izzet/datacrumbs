@@ -247,3 +247,15 @@ int BPF_UPROBE(pread_gds_entry, int fd, void* buf, u64 count, u64 offset) {
 }
 SEC("uretprobe/" LIBC_PATH ":pread")
 int BPF_URETPROBE(pread_gds_exit) { return pread_exit(ctx, CUFILE_EVENT_ID_START + 5); }
+
+/* pwrite(fd, buf, count, offset): the write-side mirror. A library that routes sub-threshold WRITES
+ * around cuFile (kvikio's POSIX shortcut) is invisible to the time basis for the same reason pread is,
+ * and its misaligned writes additionally make the device read whole blocks. Capturing size+offset lets
+ * the address basis attribute those read-modify-write commands to the exact pwrite that caused them.
+ * The entry/exit helpers are direction-agnostic, so they are reused as-is. libc pwrite64==pwrite. */
+SEC("uprobe/" LIBC_PATH ":pwrite")
+int BPF_UPROBE(pwrite_gds_entry, int fd, void* buf, u64 count, u64 offset) {
+  return pread_entry(ctx, CUFILE_EVENT_ID_START + 7, count, offset);
+}
+SEC("uretprobe/" LIBC_PATH ":pwrite")
+int BPF_URETPROBE(pwrite_gds_exit) { return pread_exit(ctx, CUFILE_EVENT_ID_START + 7); }
