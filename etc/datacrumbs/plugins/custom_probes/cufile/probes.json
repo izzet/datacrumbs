@@ -11,7 +11,9 @@
             "cuFileHandleRegister",
             "pread",
             "batchentry",
-            "pwrite"
+            "pwrite",
+            "cuFileBatchIOGetStatus",
+            "batchdone"
         ]
     }
 ]

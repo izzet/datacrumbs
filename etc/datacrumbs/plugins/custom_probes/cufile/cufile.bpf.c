@@ -8,6 +8,10 @@
 
 /* carry entry args (size/offset/count) to the matching uretprobe, keyed per (tid,event_id) */
 DATACRUMBS_MAP(cufile_args_map, struct fn_key_t, struct cufile_args_t);
+/* cuFileBatchIOGetStatus fills *nr and the events array on RETURN, so the pointers must be carried
+ * from entry to exit. Keyed by pid_tgid: one outstanding reap call per thread. */
+struct cufile_reap_t { unsigned long long nr_ptr; unsigned long long ev_ptr; };
+DATACRUMBS_MAP(cufile_reap_map, u64, struct cufile_reap_t);
 
 #define CUFILE_EVENT_ID_START 200000
 #define CUFILE_LIB "/usr/local/cuda-12.6/targets/x86_64-linux/lib/libcufile.so"
@@ -16,7 +20,14 @@ DATACRUMBS_MAP(cufile_args_map, struct fn_key_t, struct cufile_args_t);
 #define CUFILE_IOPARAMS_STRIDE 64
 #define CUFILE_IOPARAMS_OFF_FILEOFFSET 16
 #define CUFILE_IOPARAMS_OFF_SIZE 32
+#define CUFILE_IOPARAMS_OFF_COOKIE 56  /* cookie @ +56; callers set it per entry (NIXL: &params[i]) */
 #define CUFILE_BATCH_MAX 256  /* loop cap for the verifier */
+
+/* CUfileIOEvents_t layout (cufile.h): {void* cookie; CUfileStatus_t status; size_t ret} -> 24 B,
+ * cookie first. cuFileBatchIOGetStatus fills this array, so a completion carries back the same
+ * cookie the submit set, which is what retires an op from the address candidate set. */
+#define CUFILE_IOEVENTS_STRIDE 24
+#define CUFILE_IOEVENTS_OFF_COOKIE 0
 
 /* ---- entry: stamp start time; optionally stash signature-derived size/offset/count ---- */
 #if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
@@ -108,10 +119,11 @@ static inline __attribute__((always_inline)) int batch_emit(struct pt_regs* ctx,
   unsigned int n = nr;
   if (n > CUFILE_BATCH_MAX) n = CUFILE_BATCH_MAX;
   for (unsigned int i = 0; i < n; i++) {
-    u64 sz = 0, off = 0;
+    u64 sz = 0, off = 0, ck = 0;
     char* p = (char*)iocbp + (u64)i * CUFILE_IOPARAMS_STRIDE;
     bpf_probe_read_user(&sz, sizeof(sz), p + CUFILE_IOPARAMS_OFF_SIZE);
     bpf_probe_read_user(&off, sizeof(off), p + CUFILE_IOPARAMS_OFF_FILEOFFSET);
+    bpf_probe_read_user(&ck, sizeof(ck), p + CUFILE_IOPARAMS_OFF_COOKIE);
     struct cufile_event_t* event;
     DATACRUMBS_RB_RESERVE(output, struct cufile_event_t, event);
     event->type = 4;
@@ -119,7 +131,7 @@ static inline __attribute__((always_inline)) int batch_emit(struct pt_regs* ctx,
     event->event_id = event_id;
     event->ts = corr; event->dur = 0;
     event->corr_id = corr;
-    event->size = sz; event->offset = off; event->count = 0;
+    event->size = sz; event->offset = off; event->count = ck;  /* cookie identifies this entry */
     DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
   }
   return 0;
@@ -176,6 +188,69 @@ int BPF_UPROBE(cuFileBatchIOSubmit_entry, void* batch, unsigned int nr, void* io
 }
 SEC("uretprobe/" CUFILE_LIB ":cuFileBatchIOSubmit")
 int BPF_URETPROBE(cuFileBatchIOSubmit_exit) { return cufile_exit(ctx, CUFILE_EVENT_ID_START + 3); }
+
+/* ===== per-entry batch COMPLETION records =====
+ * An async submit returns before the device I/O runs, so the submit alone cannot say when an entry
+ * stopped being in flight. cuFileBatchIOGetStatus reaps completions and hands back each entry's
+ * cookie. Emitting one 'batchdone' per cookie lets offline attribution retire a completed operation
+ * from the address candidate set, so a later command over the same byte range is not ambiguous. */
+#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1) && defined(DATACRUMBS_MODE) && \
+    (DATACRUMBS_MODE == 1)
+static inline __attribute__((always_inline)) int batch_done(struct pt_regs* ctx, void* ev,
+                                                            unsigned int nr) {
+  u64 event_id = CUFILE_EVENT_ID_START + 9;   /* 'batchdone' (index 9 in probes.json) */
+  struct fn_key_t key = {};
+  key.event_id = CUFILE_EVENT_ID_START + 3;   /* same context the batch submit registered under */
+  u64 start_ts;
+  if (!need_tracing(&key, &start_ts)) return 0;
+  u64 now = bpf_ktime_get_ns();
+  unsigned int n = nr;
+  if (n > CUFILE_BATCH_MAX) n = CUFILE_BATCH_MAX;
+  for (unsigned int i = 0; i < n; i++) {
+    u64 ck = 0;
+    char* q = (char*)ev + (u64)i * CUFILE_IOEVENTS_STRIDE;
+    bpf_probe_read_user(&ck, sizeof(ck), q + CUFILE_IOEVENTS_OFF_COOKIE);
+    if (!ck) continue;
+    struct cufile_event_t* event;
+    DATACRUMBS_RB_RESERVE(output, struct cufile_event_t, event);
+    event->type = 4;
+    event->id = key.id;
+    event->event_id = event_id;
+    event->ts = now; event->dur = 0;
+    event->corr_id = 0;
+    event->size = 0; event->offset = 0; event->count = ck;   /* cookie of the entry that completed */
+    DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  }
+  return 0;
+}
+#else
+static inline __attribute__((always_inline)) int batch_done(struct pt_regs* ctx, void* ev,
+                                                            unsigned int nr) { return 0; }
+#endif
+
+/* cuFileBatchIOGetStatus(batch, min_nr, unsigned* nr, CUfileIOEvents_t* iocbp, timeout):
+ * nr and iocbp are OUT parameters, so stash them at entry and read them at return. */
+SEC("uprobe/" CUFILE_LIB ":cuFileBatchIOGetStatus")
+int BPF_UPROBE(cuFileBatchIOGetStatus_entry, void* batch, unsigned int min_nr, void* nr_p,
+               void* iocbp) {
+  u64 tid = bpf_get_current_pid_tgid();
+  struct cufile_reap_t v = {};
+  v.nr_ptr = (u64)nr_p; v.ev_ptr = (u64)iocbp;
+  bpf_map_update_elem(&cufile_reap_map, &tid, &v, BPF_ANY);
+  return 0;
+}
+SEC("uretprobe/" CUFILE_LIB ":cuFileBatchIOGetStatus")
+int BPF_URETPROBE(cuFileBatchIOGetStatus_exit) {
+  u64 tid = bpf_get_current_pid_tgid();
+  struct cufile_reap_t* v = bpf_map_lookup_elem(&cufile_reap_map, &tid);
+  if (!v) return 0;
+  unsigned int nr = 0;
+  if (v->nr_ptr) bpf_probe_read_user(&nr, sizeof(nr), (void*)v->nr_ptr);
+  void* ev = (void*)v->ev_ptr;
+  bpf_map_delete_elem(&cufile_reap_map, &tid);
+  if (!ev || !nr) return 0;
+  return batch_done(ctx, ev, nr);
+}
 
 SEC("uprobe/" CUFILE_LIB ":cuFileHandleRegister")
 int BPF_UPROBE(cuFileHandleRegister_entry) {
