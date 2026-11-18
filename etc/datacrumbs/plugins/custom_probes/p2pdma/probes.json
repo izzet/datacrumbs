@@ -1,0 +1,9 @@
+[
+    {
+        "type": 1,
+        "name": "p2pdma",
+        "functions": [
+            "pci_p2pdma_map_segment"
+        ]
+    }
+]

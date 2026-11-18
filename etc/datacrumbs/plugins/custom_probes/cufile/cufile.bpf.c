@@ -14,7 +14,10 @@ struct cufile_reap_t { unsigned long long nr_ptr; unsigned long long ev_ptr; };
 DATACRUMBS_MAP(cufile_reap_map, u64, struct cufile_reap_t);
 
 #define CUFILE_EVENT_ID_START 200000
+/* Overridable so a wrapper (cufile_cuda128.bpf.c) can target another CUDA libcufile. */
+#ifndef CUFILE_LIB
 #define CUFILE_LIB "/usr/local/cuda-12.6/targets/x86_64-linux/lib/libcufile.so"
+#endif
 
 /* CUfileIOParams_t layout (cufile.h): stride 64 B; file_offset @ +16, size @ +32 (union.batch). */
 #define CUFILE_IOPARAMS_STRIDE 64
