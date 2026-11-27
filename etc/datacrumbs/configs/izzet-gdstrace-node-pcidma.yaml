@@ -1,0 +1,40 @@
+name: izzet-gdstrace-node-pcidma
+# GDSight host config for the kernel PCI P2PDMA transport (CUDA 12.8, GDS >= 1.13, use_pci_p2pdma).
+# Same as izzet-gdstrace-node.yaml except: the cuFile plugin targets the CUDA 12.8 libcufile, and the
+# p2pdma plugin replaces nvidiafs (nvidia-fs is bypassed on this transport and may not be loaded).
+# Build with -DDATACRUMBS_HOST=izzet-gdstrace-node-pcidma. (No digits: DataCrumbs strips them from host names.)
+# Base: syscall-I/O custom probes (custom1) + a custom cuFile plugin (cufile)
+# with explicit, signature-aware uprobe handlers that capture per-op size/offset (event_type 3).
+capture_probes:
+  - name: custom1
+    start_event_id: 100000
+    probe: custom
+    type: custom
+    file: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/sys_io/sysio.bpf.c
+    probes: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/sys_io/probes.json
+    process_header: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/sys_io/sysio_process.h
+    event_type: 2
+  - name: cufile
+    start_event_id: 200000
+    probe: custom
+    type: custom
+    file: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/cufile/cufile_cuda128.bpf.c
+    probes: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/cufile/probes_cuda128.json
+    process_header: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/cufile/cufile_process.h
+    event_type: 4
+  - name: block
+    start_event_id: 300000
+    probe: custom
+    type: custom
+    file: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/block/block.bpf.c
+    probes: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/block/probes.json
+    process_header: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/block/block_process.h
+    event_type: 5
+  - name: p2pdma
+    start_event_id: 500000
+    probe: custom
+    type: custom
+    file: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/p2pdma/p2pdma.bpf.c
+    probes: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/p2pdma/probes.json
+    process_header: @DATACRUMBS_PROJECT_PATH@/etc/datacrumbs/plugins/custom_probes/p2pdma/p2pdma_process.h
+    event_type: 7

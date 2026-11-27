@@ -3,7 +3,7 @@
 static inline __attribute__((always_inline)) int generic_trace_datacrumbs_start() {
   u64 tsp = bpf_ktime_get_ns();
   u64 id = bpf_get_current_pid_tgid();
-  u32 pid = id & 0xFFFFFFFF;
+  u32 pid = id >> 32;  // GDS-Trace: key pid_map by TGID so all threads (worker I/O) are traced
   u64* start_ts = bpf_map_lookup_elem(&pid_map, &pid);
   if (start_ts != 0) tsp = *start_ts;
 #if defined(DATACRUMBS_MODE) && (DATACRUMBS_MODE == 2)
@@ -28,7 +28,7 @@ static inline __attribute__((always_inline)) int generic_trace_datacrumbs_start(
 }
 static inline __attribute__((always_inline)) int generic_trace_datacrumbs_stop() {
   u64 id = bpf_get_current_pid_tgid();
-  u32 pid = id & 0xFFFFFFFF;
+  u32 pid = id >> 32;  // GDS-Trace: key pid_map by TGID so all threads (worker I/O) are traced
   (void)pid;
   DBG_PRINTK("Stop tracing PID %d", pid);
   bpf_map_delete_elem(&pid_map, &pid);

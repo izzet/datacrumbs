@@ -1,0 +1,339 @@
+#include "cufile.bpf.h"
+
+#include <datacrumbs/server/bpf/common.h>
+
+/* cuFile plugin OWNS the GDS-Trace correlation maps; nvidiafs/block extern them. */
+#define GDSTRACE_CORR_OWNER
+#include "../gdstrace_corr.bpf.h"
+
+/* carry entry args (size/offset/count) to the matching uretprobe, keyed per (tid,event_id) */
+DATACRUMBS_MAP(cufile_args_map, struct fn_key_t, struct cufile_args_t);
+/* cuFileBatchIOGetStatus fills *nr and the events array on RETURN, so the pointers must be carried
+ * from entry to exit. Keyed by pid_tgid: one outstanding reap call per thread. */
+struct cufile_reap_t { unsigned long long nr_ptr; unsigned long long ev_ptr; };
+DATACRUMBS_MAP(cufile_reap_map, u64, struct cufile_reap_t);
+
+#define CUFILE_EVENT_ID_START 200000
+/* Overridable so a wrapper (cufile_cuda128.bpf.c) can target another CUDA libcufile. */
+#ifndef CUFILE_LIB
+#define CUFILE_LIB "/usr/local/cuda-12.6/targets/x86_64-linux/lib/libcufile.so"
+#endif
+
+/* CUfileIOParams_t layout (cufile.h): stride 64 B; file_offset @ +16, size @ +32 (union.batch). */
+#define CUFILE_IOPARAMS_STRIDE 64
+#define CUFILE_IOPARAMS_OFF_FILEOFFSET 16
+#define CUFILE_IOPARAMS_OFF_SIZE 32
+#define CUFILE_IOPARAMS_OFF_COOKIE 56  /* cookie @ +56; callers set it per entry (NIXL: &params[i]) */
+#define CUFILE_BATCH_MAX 256  /* loop cap for the verifier */
+
+/* CUfileIOEvents_t layout (cufile.h): {void* cookie; CUfileStatus_t status; size_t ret} -> 24 B,
+ * cookie first. cuFileBatchIOGetStatus fills this array, so a completion carries back the same
+ * cookie the submit set, which is what retires an op from the address candidate set. */
+#define CUFILE_IOEVENTS_STRIDE 24
+#define CUFILE_IOEVENTS_OFF_COOKIE 0
+
+/* ---- entry: stamp start time; optionally stash signature-derived size/offset/count ---- */
+#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
+static inline __attribute__((always_inline)) int cufile_entry(struct pt_regs* ctx, u64 event_id,
+                                                              u64 size, u64 offset, u64 count,
+                                                              int has_args) {
+  struct fn_key_t key = {};
+  key.event_id = event_id;
+  u64 start_ts;
+  if (!need_tracing(&key, &start_ts)) return 0;  // not tracing this process
+  struct fn_value_t fn = {};
+  fn.ts = bpf_ktime_get_ns();
+  bpf_map_update_elem(&fn_pid_map, &key, &fn, BPF_ANY);
+  /* register this op's corr_id (= entry ts) so device ops (nvfs_io/NVMe) attribute to it by id,
+   * whether they fire on this thread (synchronous) or on cuFile's worker threads (fastsafetensors). */
+  gdstrace_corr_begin(fn.ts);
+  if (has_args) {
+    struct cufile_args_t a = {};
+    a.size = size;
+    a.offset = offset;
+    a.count = count;
+    bpf_map_update_elem(&cufile_args_map, &key, &a, BPF_ANY);
+  }
+  return 0;
+}
+#else
+static inline __attribute__((always_inline)) int cufile_entry(struct pt_regs* ctx, u64 event_id,
+                                                              u64 size, u64 offset, u64 count,
+                                                              int has_args) {
+  return 0;
+}
+#endif
+
+/* ---- exit: emit cufile_event_t (type=4) with duration (+ size/offset/count if captured) ---- */
+#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1) && defined(DATACRUMBS_MODE) && \
+    (DATACRUMBS_MODE == 1)
+static inline __attribute__((always_inline)) int cufile_exit(struct pt_regs* ctx, u64 event_id) {
+  u64 te = bpf_ktime_get_ns();
+  struct fn_key_t key = {};
+  key.event_id = event_id;
+  u64 start_ts;
+  if (!need_tracing(&key, &start_ts)) return 0;
+  struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
+  if (fn == 0) return 0;  // missed entry
+  u64 corr = fn->ts;     // this op's correlation id (= entry ts)
+  gdstrace_corr_end();   // op done: stop attributing device ops to it
+  DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
+  struct cufile_event_t* event;
+  DATACRUMBS_RB_RESERVE(output, struct cufile_event_t, event);
+  event->type = 4;  // -> get_data_4 (1=general,2=sys_io,3=usdt already used)
+  event->id = key.id;
+  event->event_id = event_id;
+  DATACRUMBS_COLLECT_TIME(event);
+  event->corr_id = corr;
+  event->size = 0;
+  event->offset = 0;
+  event->count = 0;
+  struct cufile_args_t* a = bpf_map_lookup_elem(&cufile_args_map, &key);
+  if (a != 0) {
+    event->size = a->size;
+    event->offset = a->offset;
+    event->count = a->count;
+    bpf_map_delete_elem(&cufile_args_map, &key);
+  }
+  DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  return 0;
+}
+#else
+static inline __attribute__((always_inline)) int cufile_exit(struct pt_regs* ctx, u64 event_id) {
+  return 0;
+}
+#endif
+
+/* ===== per-entry batch OP records =====
+ * cuFileBatchIOSubmit carries nr independent (offset,size) requests. The one call is one temporal
+ * event (batch-granular time basis), but the address basis needs each entry's range, so we emit one
+ * 'batchentry' event per iocbp[i] carrying its own offset/size and the shared batch corr_id. */
+#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1) && defined(DATACRUMBS_MODE) && \
+    (DATACRUMBS_MODE == 1)
+static inline __attribute__((always_inline)) int batch_emit(struct pt_regs* ctx, void* iocbp,
+                                                            unsigned int nr) {
+  u64 event_id = CUFILE_EVENT_ID_START + 6;   /* 'batchentry' */
+  struct fn_key_t key = {};
+  key.event_id = CUFILE_EVENT_ID_START + 3;   /* the batch op registered its corr_id under this key */
+  u64 start_ts;
+  if (!need_tracing(&key, &start_ts)) return 0;
+  struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
+  u64 corr = fn ? fn->ts : 0;
+  unsigned int n = nr;
+  if (n > CUFILE_BATCH_MAX) n = CUFILE_BATCH_MAX;
+  for (unsigned int i = 0; i < n; i++) {
+    u64 sz = 0, off = 0, ck = 0;
+    char* p = (char*)iocbp + (u64)i * CUFILE_IOPARAMS_STRIDE;
+    bpf_probe_read_user(&sz, sizeof(sz), p + CUFILE_IOPARAMS_OFF_SIZE);
+    bpf_probe_read_user(&off, sizeof(off), p + CUFILE_IOPARAMS_OFF_FILEOFFSET);
+    bpf_probe_read_user(&ck, sizeof(ck), p + CUFILE_IOPARAMS_OFF_COOKIE);
+    struct cufile_event_t* event;
+    DATACRUMBS_RB_RESERVE(output, struct cufile_event_t, event);
+    event->type = 4;
+    event->id = key.id;
+    event->event_id = event_id;
+    event->ts = corr; event->dur = 0;
+    event->corr_id = corr;
+    event->size = sz; event->offset = off; event->count = ck;  /* cookie identifies this entry */
+    DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  }
+  return 0;
+}
+#else
+static inline __attribute__((always_inline)) int batch_emit(struct pt_regs* ctx, void* iocbp,
+                                                            unsigned int nr) { return 0; }
+#endif
+
+/* ===== explicit, signature-aware SEC programs per cuFile function =====
+ * cuFileRead/Write(fh, bufPtr_base, size, file_offset, bufPtr_offset): size=arg3, offset=arg4. */
+SEC("uprobe/" CUFILE_LIB ":cuFileRead")
+int BPF_UPROBE(cuFileRead_entry, void* fh, void* buf, u64 size, u64 file_offset) {
+  return cufile_entry(ctx, CUFILE_EVENT_ID_START + 0, size, file_offset, 0, 1);
+}
+SEC("uretprobe/" CUFILE_LIB ":cuFileRead")
+int BPF_URETPROBE(cuFileRead_exit) { return cufile_exit(ctx, CUFILE_EVENT_ID_START + 0); }
+
+SEC("uprobe/" CUFILE_LIB ":cuFileWrite")
+int BPF_UPROBE(cuFileWrite_entry, void* fh, void* buf, u64 size, u64 file_offset) {
+  return cufile_entry(ctx, CUFILE_EVENT_ID_START + 1, size, file_offset, 0, 1);
+}
+SEC("uretprobe/" CUFILE_LIB ":cuFileWrite")
+int BPF_URETPROBE(cuFileWrite_exit) { return cufile_exit(ctx, CUFILE_EVENT_ID_START + 1); }
+
+/* cuFileReadAsync(fh, buf, size_t* size_p, off_t* file_offset_p, ...): size/offset are POINTERS. */
+SEC("uprobe/" CUFILE_LIB ":cuFileReadAsync")
+int BPF_UPROBE(cuFileReadAsync_entry, void* fh, void* buf, u64* size_p, u64* file_offset_p) {
+  u64 size = 0, off = 0;
+  if (size_p) bpf_probe_read_user(&size, sizeof(size), size_p);
+  if (file_offset_p) bpf_probe_read_user(&off, sizeof(off), file_offset_p);
+  return cufile_entry(ctx, CUFILE_EVENT_ID_START + 2, size, off, 0, 1);
+}
+SEC("uretprobe/" CUFILE_LIB ":cuFileReadAsync")
+int BPF_URETPROBE(cuFileReadAsync_exit) { return cufile_exit(ctx, CUFILE_EVENT_ID_START + 2); }
+
+/* cuFileBatchIOSubmit(batch, nr, CUfileIOParams_t* iocbp, flags): walk the array, sum per-op sizes,
+ * record nr as count and the total requested bytes as size. */
+SEC("uprobe/" CUFILE_LIB ":cuFileBatchIOSubmit")
+int BPF_UPROBE(cuFileBatchIOSubmit_entry, void* batch, unsigned int nr, void* iocbp,
+               unsigned int flags) {
+  u64 total = 0, off0 = 0;
+  unsigned int n = nr;
+  if (n > CUFILE_BATCH_MAX) n = CUFILE_BATCH_MAX;
+  for (unsigned int i = 0; i < n; i++) {
+    u64 sz = 0;
+    char* p = (char*)iocbp + (u64)i * CUFILE_IOPARAMS_STRIDE;
+    bpf_probe_read_user(&sz, sizeof(sz), p + CUFILE_IOPARAMS_OFF_SIZE);
+    total += sz;
+    if (i == 0) bpf_probe_read_user(&off0, sizeof(off0), p + CUFILE_IOPARAMS_OFF_FILEOFFSET);
+  }
+  cufile_entry(ctx, CUFILE_EVENT_ID_START + 3, total, off0, nr, 1);   /* batch-level: corr_id + aggregate */
+  return batch_emit(ctx, iocbp, nr);                                  /* per-entry OP records for address */
+}
+SEC("uretprobe/" CUFILE_LIB ":cuFileBatchIOSubmit")
+int BPF_URETPROBE(cuFileBatchIOSubmit_exit) { return cufile_exit(ctx, CUFILE_EVENT_ID_START + 3); }
+
+/* ===== per-entry batch COMPLETION records =====
+ * An async submit returns before the device I/O runs, so the submit alone cannot say when an entry
+ * stopped being in flight. cuFileBatchIOGetStatus reaps completions and hands back each entry's
+ * cookie. Emitting one 'batchdone' per cookie lets offline attribution retire a completed operation
+ * from the address candidate set, so a later command over the same byte range is not ambiguous. */
+#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1) && defined(DATACRUMBS_MODE) && \
+    (DATACRUMBS_MODE == 1)
+static inline __attribute__((always_inline)) int batch_done(struct pt_regs* ctx, void* ev,
+                                                            unsigned int nr) {
+  u64 event_id = CUFILE_EVENT_ID_START + 9;   /* 'batchdone' (index 9 in probes.json) */
+  struct fn_key_t key = {};
+  key.event_id = CUFILE_EVENT_ID_START + 3;   /* same context the batch submit registered under */
+  u64 start_ts;
+  if (!need_tracing(&key, &start_ts)) return 0;
+  u64 now = bpf_ktime_get_ns();
+  unsigned int n = nr;
+  if (n > CUFILE_BATCH_MAX) n = CUFILE_BATCH_MAX;
+  for (unsigned int i = 0; i < n; i++) {
+    u64 ck = 0;
+    char* q = (char*)ev + (u64)i * CUFILE_IOEVENTS_STRIDE;
+    bpf_probe_read_user(&ck, sizeof(ck), q + CUFILE_IOEVENTS_OFF_COOKIE);
+    if (!ck) continue;
+    struct cufile_event_t* event;
+    DATACRUMBS_RB_RESERVE(output, struct cufile_event_t, event);
+    event->type = 4;
+    event->id = key.id;
+    event->event_id = event_id;
+    event->ts = now; event->dur = 0;
+    event->corr_id = 0;
+    event->size = 0; event->offset = 0; event->count = ck;   /* cookie of the entry that completed */
+    DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  }
+  return 0;
+}
+#else
+static inline __attribute__((always_inline)) int batch_done(struct pt_regs* ctx, void* ev,
+                                                            unsigned int nr) { return 0; }
+#endif
+
+/* cuFileBatchIOGetStatus(batch, min_nr, unsigned* nr, CUfileIOEvents_t* iocbp, timeout):
+ * nr and iocbp are OUT parameters, so stash them at entry and read them at return. */
+SEC("uprobe/" CUFILE_LIB ":cuFileBatchIOGetStatus")
+int BPF_UPROBE(cuFileBatchIOGetStatus_entry, void* batch, unsigned int min_nr, void* nr_p,
+               void* iocbp) {
+  u64 tid = bpf_get_current_pid_tgid();
+  struct cufile_reap_t v = {};
+  v.nr_ptr = (u64)nr_p; v.ev_ptr = (u64)iocbp;
+  bpf_map_update_elem(&cufile_reap_map, &tid, &v, BPF_ANY);
+  return 0;
+}
+SEC("uretprobe/" CUFILE_LIB ":cuFileBatchIOGetStatus")
+int BPF_URETPROBE(cuFileBatchIOGetStatus_exit) {
+  u64 tid = bpf_get_current_pid_tgid();
+  struct cufile_reap_t* v = bpf_map_lookup_elem(&cufile_reap_map, &tid);
+  if (!v) return 0;
+  unsigned int nr = 0;
+  if (v->nr_ptr) bpf_probe_read_user(&nr, sizeof(nr), (void*)v->nr_ptr);
+  void* ev = (void*)v->ev_ptr;
+  bpf_map_delete_elem(&cufile_reap_map, &tid);
+  if (!ev || !nr) return 0;
+  return batch_done(ctx, ev, nr);
+}
+
+SEC("uprobe/" CUFILE_LIB ":cuFileHandleRegister")
+int BPF_UPROBE(cuFileHandleRegister_entry) {
+  return cufile_entry(ctx, CUFILE_EVENT_ID_START + 4, 0, 0, 0, 0);
+}
+SEC("uretprobe/" CUFILE_LIB ":cuFileHandleRegister")
+int BPF_URETPROBE(cuFileHandleRegister_exit) { return cufile_exit(ctx, CUFILE_EVENT_ID_START + 4); }
+
+/* ===== POSIX pread offset capture (for the silent kvikio POSIX-bypass class) =====
+ * These reads never enter cuFile, so they must NOT register a corr_id (that is the whole point: the
+ * time basis cannot see them). We only capture size+offset so the ADDRESS basis can attribute each
+ * bypassed device command to the exact pread that issued it. libc pread64==pread==__pread64 (aliases). */
+#define LIBC_PATH "/usr/lib/x86_64-linux-gnu/libc.so.6"
+#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1)
+static inline __attribute__((always_inline)) int pread_entry(struct pt_regs* ctx, u64 event_id,
+                                                             u64 count, u64 offset) {
+  struct fn_key_t key = {};
+  key.event_id = event_id;
+  u64 start_ts;
+  if (!need_tracing(&key, &start_ts)) return 0;  // not tracing this process
+  struct fn_value_t fn = {};
+  fn.ts = bpf_ktime_get_ns();
+  bpf_map_update_elem(&fn_pid_map, &key, &fn, BPF_ANY);
+  struct cufile_args_t a = {};
+  a.size = count; a.offset = offset; a.count = 0;   // NB: no gdstrace_corr_begin -> POSIX carries no corr_id
+  bpf_map_update_elem(&cufile_args_map, &key, &a, BPF_ANY);
+  return 0;
+}
+#else
+static inline __attribute__((always_inline)) int pread_entry(struct pt_regs* ctx, u64 event_id,
+                                                             u64 count, u64 offset) { return 0; }
+#endif
+
+#if defined(DATACRUMBS_ENABLE) && (DATACRUMBS_ENABLE == 1) && defined(DATACRUMBS_MODE) && \
+    (DATACRUMBS_MODE == 1)
+static inline __attribute__((always_inline)) int pread_exit(struct pt_regs* ctx, u64 event_id) {
+  u64 te = bpf_ktime_get_ns();
+  struct fn_key_t key = {};
+  key.event_id = event_id;
+  u64 start_ts;
+  if (!need_tracing(&key, &start_ts)) return 0;
+  struct fn_value_t* fn = bpf_map_lookup_elem(&fn_pid_map, &key);
+  if (fn == 0) return 0;  // missed entry
+  DATACRUMBS_SKIP_SMALL_EVENTS(fn, te);
+  struct cufile_event_t* event;
+  DATACRUMBS_RB_RESERVE(output, struct cufile_event_t, event);
+  event->type = 4;
+  event->id = key.id;
+  event->event_id = event_id;
+  DATACRUMBS_COLLECT_TIME(event);
+  event->corr_id = 0;  // POSIX: no cuFile correlation id
+  event->size = 0; event->offset = 0; event->count = 0;
+  struct cufile_args_t* a = bpf_map_lookup_elem(&cufile_args_map, &key);
+  if (a != 0) {
+    event->size = a->size; event->offset = a->offset;
+    bpf_map_delete_elem(&cufile_args_map, &key);
+  }
+  DATACRUMBS_EVENT_SUBMIT(event, key.id, event_id);
+  return 0;
+}
+#else
+static inline __attribute__((always_inline)) int pread_exit(struct pt_regs* ctx, u64 event_id) { return 0; }
+#endif
+
+/* pread(fd, buf, count, offset): count=arg3, offset=arg4. */
+SEC("uprobe/" LIBC_PATH ":pread")
+int BPF_UPROBE(pread_gds_entry, int fd, void* buf, u64 count, u64 offset) {
+  return pread_entry(ctx, CUFILE_EVENT_ID_START + 5, count, offset);
+}
+SEC("uretprobe/" LIBC_PATH ":pread")
+int BPF_URETPROBE(pread_gds_exit) { return pread_exit(ctx, CUFILE_EVENT_ID_START + 5); }
+
+/* pwrite(fd, buf, count, offset): the write-side mirror. A library that routes sub-threshold WRITES
+ * around cuFile (kvikio's POSIX shortcut) is invisible to the time basis for the same reason pread is,
+ * and its misaligned writes additionally make the device read whole blocks. Capturing size+offset lets
+ * the address basis attribute those read-modify-write commands to the exact pwrite that caused them.
+ * The entry/exit helpers are direction-agnostic, so they are reused as-is. libc pwrite64==pwrite. */
+SEC("uprobe/" LIBC_PATH ":pwrite")
+int BPF_UPROBE(pwrite_gds_entry, int fd, void* buf, u64 count, u64 offset) {
+  return pread_entry(ctx, CUFILE_EVENT_ID_START + 7, count, offset);
+}
+SEC("uretprobe/" LIBC_PATH ":pwrite")
+int BPF_URETPROBE(pwrite_gds_exit) { return pread_exit(ctx, CUFILE_EVENT_ID_START + 7); }

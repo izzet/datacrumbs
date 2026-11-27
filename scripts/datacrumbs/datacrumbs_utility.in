@@ -77,11 +77,13 @@ function datacrumbs_start_server() {
 	if [[ "${DRY_RUN:-0}" == "1" ]]; then
 		server_launch "${cmd[@]}"
 	else
-		server_launch "${cmd[@]}" >$DATACRUMBS_LOG_FILE 2>&1 &
+		( umask 000; : > "$DATACRUMBS_LOG_FILE" ) 2>/dev/null || sudo sh -c ': > "$1"' _ "$DATACRUMBS_LOG_FILE" 2>/dev/null || true
+		chmod 666 "$DATACRUMBS_LOG_FILE" 2>/dev/null || sudo chmod 666 "$DATACRUMBS_LOG_FILE" 2>/dev/null || true
+		server_launch "${cmd[@]}" >>$DATACRUMBS_LOG_FILE 2>&1 &
 		PID=$!
 		echo $PID >"$DATACRUMBS_SERVER_SYSTEMD_PID_FILE"
 		log "Service started with PID: $PID"
-		chown ${DATACRUMBS_USER}:${DATACRUMBS_USER} $DATACRUMBS_LOG_FILE
+		chown ${DATACRUMBS_USER}:${DATACRUMBS_USER} $DATACRUMBS_LOG_FILE 2>/dev/null || true
 	fi
 
 	if [[ "${DRY_RUN:-0}" == "1" ]]; then
@@ -115,7 +117,8 @@ function datacrumbs_stop_server() {
 	if [[ "${DRY_RUN:-0}" == "1" ]]; then
 		server_launch "${cmd[@]}"
 	else
-		server_launch "${cmd[@]}" >>$DATACRUMBS_LOG_FILE 2>&1
+		chmod 666 "$DATACRUMBS_LOG_FILE" 2>/dev/null || sudo chmod 666 "$DATACRUMBS_LOG_FILE" 2>/dev/null || true
+		server_launch "${cmd[@]}" >>$DATACRUMBS_LOG_FILE 2>&1 || true
 	fi
 
 	if [[ "${DRY_RUN:-0}" == "1" ]]; then
